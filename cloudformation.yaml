@@ -1,0 +1,1653 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: CloudFormation template for creating T-Time Game
+
+Resources:
+  MyWebSocketApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: MyWebSocketApi
+      ProtocolType: WEBSOCKET
+      RouteSelectionExpression: $request.body.action
+
+  nodeJSDependencyLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: nodeJSDependencyLayer
+      Description: My NodeJS Dependencies Layer
+      Content:
+        S3Bucket: cf-templates-kjc1skhpxjxe-us-east-1
+        S3Key: nodejs.zip
+
+  connectCF:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: connectCF
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: arn:aws:iam::858458372151:role/LabRole
+      Layers:
+        - !Ref nodeJSDependencyLayer
+      Code:
+        ZipFile: |
+          exports.handler = async (event) => {
+            const { connectionId } = event.requestContext;
+            return {
+              statusCode: 200,
+              body: JSON.stringify({ connectionId, message: "Connected successfully!" }),
+            };
+          };
+    DependsOn:
+      - nodeJSDependencyLayer
+
+  disconnectCF:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: disconnectCF
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: arn:aws:iam::858458372151:role/LabRole
+      Layers:
+        - !Ref nodeJSDependencyLayer
+      Code:
+        ZipFile: |
+          const AWS = require("aws-sdk");
+          const secretName = "MyWebSocketApi";
+          const secretsManager = new AWS.SecretsManager();
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+
+          const sendToOne = async (id, body) => {
+            try {
+              const secretData = await secretsManager
+                .getSecretValue({ SecretId: secretName })
+                .promise();
+              const secretValue = JSON.parse(secretData.SecretString);
+              const ENDPOINT =
+                secretValue.ApiId + ".execute-api.us-east-1.amazonaws.com/production/";
+              const client = new AWS.ApiGatewayManagementApi({ endpoint: ENDPOINT });
+              await client
+                .postToConnection({
+                  ConnectionId: id,
+                  Data: Buffer.from(JSON.stringify(body)),
+                })
+                .promise();
+            } catch (err) {
+              console.error(err);
+            }
+          };
+
+          const sendToAll = async (gameId, body) => {
+            const userparams = {
+              TableName: "users",
+              FilterExpression: "gameId = :gameId",
+              ExpressionAttributeValues: {
+                ":gameId": gameId,
+              },
+              ProjectionExpression: "id",
+            };
+            const result = await dynamodb.scan(userparams).promise();
+            let items = result.Items;
+            const all = items.map((i) => sendToOne(i.id, body));
+            return Promise.all(all);
+          };
+
+          exports.handler = async (event, context) => {
+            const { connectionId } = event.requestContext;
+
+            try {
+              const userparams = {
+                TableName: "users",
+                Key: {
+                  id: connectionId,
+                },
+              };
+              const result = await dynamodb.get(userparams).promise();
+              const item = result.Item;
+              if (item) {
+                await dynamodb.delete(userparams).promise();
+                await sendToAll(item.gameId, {
+                  origin: "disconnect",
+                  message: `${item.name} has left the lobby`,
+                  removedUser: item,
+                });
+              }
+              return {
+                statusCode: 200,
+                body: JSON.stringify({ message: "Entry deleted successfully" }),
+              };
+            } catch (error) {
+              console.error("Error deleting entry:", error);
+              return {
+                statusCode: 500,
+                body: JSON.stringify({ message: "Error deleting entry" }),
+              };
+            }
+          };
+    DependsOn:
+      - nodeJSDependencyLayer
+
+  createLobbyCF:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: createLobbyCF
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: arn:aws:iam::858458372151:role/LabRole
+      Layers:
+        - !Ref nodeJSDependencyLayer
+      Code:
+        ZipFile: |
+          const AWS = require("aws-sdk");
+          const secretName = "MyWebSocketApi";
+          const secretsManager = new AWS.SecretsManager();
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+
+          const sendToOne = async (id, body) => {
+            try {
+              const secretData = await secretsManager
+                .getSecretValue({ SecretId: secretName })
+                .promise();
+              const secretValue = JSON.parse(secretData.SecretString);
+              const ENDPOINT =
+                secretValue.ApiId + ".execute-api.us-east-1.amazonaws.com/production/";
+              const client = new AWS.ApiGatewayManagementApi({ endpoint: ENDPOINT });
+              await client
+                .postToConnection({
+                  ConnectionId: id,
+                  Data: Buffer.from(JSON.stringify(body)),
+                })
+                .promise();
+            } catch (err) {
+              console.error(err);
+            }
+          };
+          exports.handler = async (event, context) => {
+            const nanoid = await import("nanoid");
+            const { connectionId } = event.requestContext;
+            const { totalRound, name } = JSON.parse(event.body);
+            const generatedId = nanoid.customAlphabet(
+              "1234567890abcdefghijklmnopqrstuvwxyz",
+              6
+            );
+            const gameparams = {
+              TableName: "games",
+              Item: {
+                id: generatedId(),
+                creatorId: connectionId,
+                selectorId: "",
+                currentRound: 0,
+                totalRound: totalRound,
+                movieName: "",
+                actorName: "",
+                actressName: "",
+                hasStarted: false,
+                createdAt: Date.now(),
+              },
+            };
+
+            const userparams = {
+              TableName: "users",
+              Item: {
+                id: connectionId,
+                name,
+                score: 0,
+                currentRound: 1,
+                gameId: gameparams.Item.id,
+              },
+            };
+
+            try {
+              await dynamodb.put(userparams).promise();
+              await dynamodb.put(gameparams).promise();
+              await sendToOne(connectionId, {
+                origin: "connect",
+                message: `${userparams.Item.name} has joined the lobby`,
+                newPlayer: userparams.Item,
+                totalPlayers: [userparams.Item],
+                gameDetails: gameparams.Item,
+              });
+              return {
+                statusCode: 200,
+                body: JSON.stringify({ message: "Entry created successfully" }),
+              };
+            } catch (error) {
+              console.error("Error creating entry:", error);
+              return {
+                statusCode: 500,
+                body: JSON.stringify({ message: "Error creating entry" }),
+              };
+            }
+          };
+    DependsOn:
+      - nodeJSDependencyLayer
+
+  joinLobbyCF:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: joinLobbyCF
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: arn:aws:iam::858458372151:role/LabRole
+      Layers:
+        - !Ref nodeJSDependencyLayer
+      Code:
+        ZipFile: |
+          const AWS = require("aws-sdk");
+          const secretName = "MyWebSocketApi";
+          const secretsManager = new AWS.SecretsManager();
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+
+          const sendToOne = async (id, body) => {
+            try {
+              const secretData = await secretsManager
+                .getSecretValue({ SecretId: secretName })
+                .promise();
+              const secretValue = JSON.parse(secretData.SecretString);
+              const ENDPOINT =
+                secretValue.ApiId + ".execute-api.us-east-1.amazonaws.com/production/";
+              const client = new AWS.ApiGatewayManagementApi({ endpoint: ENDPOINT });
+              await client
+                .postToConnection({
+                  ConnectionId: id,
+                  Data: Buffer.from(JSON.stringify(body)),
+                })
+                .promise();
+            } catch (err) {
+              console.error(err);
+            }
+          };
+
+          const sendToAll = async (gameId, user, connectionId, gameDetails, body) => {
+            const userparams = {
+              TableName: "users",
+              FilterExpression: "gameId = :gameId",
+              ExpressionAttributeValues: {
+                ":gameId": gameId,
+              },
+            };
+            const result = await dynamodb.scan(userparams).promise();
+            let items = result.Items;
+            await sendToOne(connectionId, {
+              origin: "connect",
+              message: `${user.Item.name} has joined the lobby`,
+              newPlayer: user.Item,
+              totalPlayers: items,
+              gameDetails: gameDetails,
+            });
+            const all = items.map((i) => sendToOne(i.id, body));
+            return Promise.all(all);
+          };
+
+          exports.handler = async (event, context) => {
+            const { connectionId } = event.requestContext;
+            const { gameId, name } = JSON.parse(event.body);
+
+            const gameparams = {
+              TableName: "games",
+              Key: {
+                id: gameId,
+              },
+              FilterExpression: "hasStarted = :hasStarted",
+              ExpressionAttributeValues: {
+                ":hasStarted": false,
+              },
+            };
+
+            const userparams = {
+              TableName: "users",
+              Item: {
+                id: connectionId,
+                name,
+                score: 0,
+                currentRound: 1,
+                gameId,
+              },
+            };
+
+            try {
+              let res = await dynamodb.get(gameparams).promise();
+              if (!res.Item) {
+                await sendToOne(connectionId, {
+                  message: `${gameId} group doesn't exists or the game has already started`,
+                  origin: "error",
+                });
+                return {
+                  statusCode: 500,
+                  body: JSON.stringify({ message: "No such group exists" }),
+                };
+              }
+              await dynamodb.put(userparams).promise();
+              await sendToAll(gameId, userparams, connectionId, res.Item, {
+                message: `${userparams.Item.name} has joined the lobby`,
+                newPlayer: userparams.Item,
+                origin: "newPlayerConnect",
+              });
+              return {
+                statusCode: 200,
+                body: JSON.stringify({ message: "User joined the lobby successfully" }),
+              };
+            } catch (error) {
+              console.error("Error creating entry:", error);
+              return {
+                statusCode: 500,
+                body: JSON.stringify({ message: "Error creating entry" }),
+              };
+            }
+          };
+    DependsOn:
+      - nodeJSDependencyLayer
+
+  startGameCF:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: startGameCF
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: arn:aws:iam::858458372151:role/LabRole
+      Layers:
+        - !Ref nodeJSDependencyLayer
+      Code:
+        ZipFile: |
+          const AWS = require("aws-sdk");
+          const secretName = "MyWebSocketApi";
+          const secretsManager = new AWS.SecretsManager();
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+
+          const sendToOne = async (id, body) => {
+            try {
+              const secretData = await secretsManager
+                .getSecretValue({ SecretId: secretName })
+                .promise();
+              const secretValue = JSON.parse(secretData.SecretString);
+              const ENDPOINT =
+                secretValue.ApiId + ".execute-api.us-east-1.amazonaws.com/production/";
+              const client = new AWS.ApiGatewayManagementApi({ endpoint: ENDPOINT });
+              await client
+                .postToConnection({
+                  ConnectionId: id,
+                  Data: Buffer.from(JSON.stringify(body)),
+                })
+                .promise();
+            } catch (err) {
+              console.error(err);
+            }
+          };
+
+          const sendToAll = async (gameId, body) => {
+            const userparams = {
+              TableName: "users",
+              FilterExpression: "gameId = :gameId",
+              ExpressionAttributeValues: {
+                ":gameId": gameId,
+              },
+              ProjectionExpression: "id",
+            };
+            const result = await dynamodb.scan(userparams).promise();
+            let items = result.Items;
+            const all = items.map((i) => sendToOne(i.id, body));
+            return Promise.all(all);
+          };
+
+          exports.handler = async (event, context) => {
+            const { connectionId } = event.requestContext;
+            const { gameId } = JSON.parse(event.body);
+            const userparams = {
+              TableName: "users",
+              FilterExpression: "gameId = :gameId AND currentRound = :currentRound",
+              ExpressionAttributeValues: {
+                ":gameId": gameId,
+                ":currentRound": 1,
+              },
+              ProjectionExpression: "id",
+            };
+            let result = [];
+            try {
+              result = await dynamodb.scan(userparams).promise();
+            } catch (error) {
+              console.error("Error starting game:", error);
+              return {
+                statusCode: 500,
+                body: JSON.stringify({ message: "Error starting game" }),
+              };
+            }
+
+            let items = result.Items;
+
+            // atleast two persons required for this game
+            if (items.length > 1) {
+              const selectorObj = items[Math.floor(Math.random() * items.length)];
+              const selectorId = selectorObj.id;
+
+              const userparams = {
+                TableName: "users",
+                Key: {
+                  id: selectorId,
+                },
+                UpdateExpression: "SET currentRound = currentRound + :increment",
+                ExpressionAttributeValues: {
+                  ":increment": 1,
+                },
+                ReturnValues: "ALL_NEW",
+              };
+
+              const gameparams = {
+                TableName: "games",
+                Key: {
+                  id: gameId,
+                },
+                UpdateExpression:
+                  "SET selectorId = :selectorId, hasStarted = :hasStarted, currentRound = :currentRound",
+                ExpressionAttributeValues: {
+                  ":selectorId": selectorId,
+                  ":hasStarted": true,
+                  ":currentRound": 1,
+                },
+                ReturnValues: "ALL_NEW",
+              };
+
+              try {
+                const res = await dynamodb.update(userparams).promise();
+                const user = res.Attributes;
+                const gameres = await dynamodb.update(gameparams).promise();
+                const game = gameres.Attributes;
+                await sendToAll(gameId, {
+                  origin: "startGame",
+                  message: `${user.name} is the new selector`,
+                  selector: user,
+                  gameDetails: game,
+                });
+                return {
+                  statusCode: 200,
+                  body: JSON.stringify({ message: "Game started successfully" }),
+                };
+              } catch (error) {
+                console.error("Error starting game:", error);
+                return {
+                  statusCode: 500,
+                  body: JSON.stringify({ message: "Error starting game" }),
+                };
+              }
+            } else {
+              await sendToOne(connectionId, {
+                origin: "error",
+                message: "Atleast two players are required to start the game!",
+              });
+              return {
+                statusCode: 500,
+                body: JSON.stringify("This game atleast needs two player to begin"),
+              };
+            }
+          };
+    DependsOn:
+      - nodeJSDependencyLayer
+
+  addNamesCF:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: addNamesCF
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: arn:aws:iam::858458372151:role/LabRole
+      Layers:
+        - !Ref nodeJSDependencyLayer
+      Code:
+        ZipFile: |
+          const AWS = require("aws-sdk");
+          const secretName = "MyWebSocketApi";
+          const secretsManager = new AWS.SecretsManager();
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+
+          const sendToOne = async (id, body) => {
+            try {
+              const secretData = await secretsManager
+                .getSecretValue({ SecretId: secretName })
+                .promise();
+              const secretValue = JSON.parse(secretData.SecretString);
+              const ENDPOINT =
+                secretValue.ApiId + ".execute-api.us-east-1.amazonaws.com/production/";
+              const client = new AWS.ApiGatewayManagementApi({ endpoint: ENDPOINT });
+              await client
+                .postToConnection({
+                  ConnectionId: id,
+                  Data: Buffer.from(JSON.stringify(body)),
+                })
+                .promise();
+            } catch (err) {
+              console.error(err);
+            }
+          };
+
+          const sendToAll = async (gameId, body) => {
+            const userparams = {
+              TableName: "users",
+              FilterExpression: "gameId = :gameId",
+              ExpressionAttributeValues: {
+                ":gameId": gameId,
+              },
+              ProjectionExpression: "id",
+            };
+            const result = await dynamodb.scan(userparams).promise();
+            let items = result.Items;
+            const all = items.map((i) => sendToOne(i.id, body));
+            return Promise.all(all);
+          };
+
+          exports.handler = async (event, context) => {
+            const { connectionId } = event.requestContext;
+            const { gameId, actorName, actressName, movieName } = JSON.parse(event.body);
+            const gameparams = {
+              TableName: "games",
+              Key: {
+                id: gameId,
+              },
+              UpdateExpression:
+                "SET actorName = :actorName, actressName = :actressName, movieName = :movieName",
+              ExpressionAttributeValues: {
+                ":actressName": actressName,
+                ":actorName": actorName,
+                ":movieName": movieName,
+                ":selectorId": connectionId,
+              },
+              ConditionExpression: "attribute_exists(id) AND selectorId = :selectorId",
+              ReturnValues: "ALL_NEW",
+            };
+
+            try {
+              const res = await dynamodb.update(gameparams).promise();
+              let game = res.Attributes;
+              game.actressName = game.actressName.substr(0, 1);
+              game.actorName = game.actorName.substr(0, 1);
+              game.movieName = game.movieName.substr(0, 1);
+              await sendToAll(gameId, {
+                origin: "addNames",
+                message: `Words are selected`,
+                gameDetails: game,
+              });
+              return {
+                statusCode: 200,
+                body: JSON.stringify({ message: "Game started successfully" }),
+              };
+            } catch (err) {
+              return {
+                statusCode: 500,
+                body: JSON.stringify({ message: "Error adding names" }),
+              };
+            }
+          };
+    DependsOn:
+      - nodeJSDependencyLayer
+
+  guessNamesCF:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: guessNamesCF
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: arn:aws:iam::858458372151:role/LabRole
+      Layers:
+        - !Ref nodeJSDependencyLayer
+      Code:
+        ZipFile: |
+          const AWS = require("aws-sdk");
+          const secretName = "MyWebSocketApi";
+          const secretsManager = new AWS.SecretsManager();
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+
+          const sendToOne = async (id, body) => {
+            try {
+              const secretData = await secretsManager
+                .getSecretValue({ SecretId: secretName })
+                .promise();
+              const secretValue = JSON.parse(secretData.SecretString);
+              const ENDPOINT =
+                secretValue.ApiId + ".execute-api.us-east-1.amazonaws.com/production/";
+              const client = new AWS.ApiGatewayManagementApi({ endpoint: ENDPOINT });
+              await client
+                .postToConnection({
+                  ConnectionId: id,
+                  Data: Buffer.from(JSON.stringify(body)),
+                })
+                .promise();
+            } catch (err) {
+              console.error(err);
+            }
+          };
+
+          const sendToAll = async (gameId, body) => {
+            const userparams = {
+              TableName: "users",
+              FilterExpression: "gameId = :gameId",
+              ExpressionAttributeValues: {
+                ":gameId": gameId,
+              },
+              ProjectionExpression: "id",
+            };
+            const result = await dynamodb.scan(userparams).promise();
+            let items = result.Items;
+            const all = items.map((i) => sendToOne(i.id, body));
+            return Promise.all(all);
+          };
+
+          exports.handler = async (event, context) => {
+            const nanoid = await import("nanoid");
+            const { connectionId } = event.requestContext;
+            const { gameId, actorName, actressName, movieName, roundId } = JSON.parse(
+              event.body
+            );
+            const userparams = {
+              TableName: "users",
+              Key: {
+                id: connectionId,
+              },
+            };
+
+            const gameparams = {
+              TableName: "games",
+              Key: {
+                id: gameId,
+              },
+            };
+
+            try {
+              let gameres = await dynamodb.get(gameparams).promise();
+              const result = await dynamodb.get(userparams).promise();
+              const user = result.Item;
+              const generatedId = nanoid.customAlphabet(
+                "1234567890abcdefghijklmnopqrstuvwxyz",
+                8
+              );
+              if (user) {
+                if (actorName !== undefined) {
+                  await sendToAll(gameId, {
+                    origin: "guessNames",
+                    type: "actorName",
+                    message: `guessed by ${user.name}`,
+                    roundId: roundId,
+                    userId: user.id,
+                    guessName: actorName,
+                    guessId: generatedId(),
+                    selectorId: gameres.Item.selectorId,
+                  });
+                }
+
+                if (actressName !== undefined) {
+                  await sendToAll(gameId, {
+                    origin: "guessNames",
+                    type: "actressName",
+                    message: `guessed by ${user.name}`,
+                    roundId: roundId,
+                    userId: user.id,
+                    guessName: actressName,
+                    guessId: generatedId(),
+                    selectorId: gameres.Item.selectorId,
+                  });
+                }
+
+                if (movieName !== undefined) {
+                  await sendToAll(gameId, {
+                    origin: "guessNames",
+                    type: "movieName",
+                    message: `guessed by ${user.name}`,
+                    roundId: roundId,
+                    userId: user.id,
+                    guessName: movieName,
+                    guessId: generatedId(),
+                    selectorId: gameres.Item.selectorId,
+                  });
+                }
+                return {
+                  statusCode: 200,
+                  body: JSON.stringify({ message: "Guessed send to lobby successfully" }),
+                };
+              } else {
+                return {
+                  statusCode: 404,
+                  body: JSON.stringify({ message: "User not found" }),
+                };
+              }
+            } catch (error) {
+              console.error("Error getting item:", error);
+              return {
+                statusCode: 500,
+                body: JSON.stringify({ message: "Error getting item" }),
+              };
+            }
+          };
+    DependsOn:
+      - nodeJSDependencyLayer
+
+  verifyGuessedNamesCF:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: verifyGuessedNamesCF
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: arn:aws:iam::858458372151:role/LabRole
+      Layers:
+        - !Ref nodeJSDependencyLayer
+      Code:
+        ZipFile: |
+          const AWS = require("aws-sdk");
+          const secretName = "MyWebSocketApi";
+          const secretsManager = new AWS.SecretsManager();
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+
+          const sendToOne = async (id, body) => {
+            try {
+              const secretData = await secretsManager
+                .getSecretValue({ SecretId: secretName })
+                .promise();
+              const secretValue = JSON.parse(secretData.SecretString);
+              const ENDPOINT =
+                secretValue.ApiId + ".execute-api.us-east-1.amazonaws.com/production/";
+              const client = new AWS.ApiGatewayManagementApi({ endpoint: ENDPOINT });
+              await client
+                .postToConnection({
+                  ConnectionId: id,
+                  Data: Buffer.from(JSON.stringify(body)),
+                })
+                .promise();
+            } catch (err) {
+              console.error(err);
+            }
+          };
+
+          const sendToAll = async (gameId, body) => {
+            const userparams = {
+              TableName: "users",
+              FilterExpression: "gameId = :gameId",
+              ExpressionAttributeValues: {
+                ":gameId": gameId,
+              },
+              ProjectionExpression: "id",
+            };
+            const result = await dynamodb.scan(userparams).promise();
+            let items = result.Items;
+            const all = items.map((i) => sendToOne(i.id, body));
+            return Promise.all(all);
+          };
+
+          exports.handler = async (event, context) => {
+            const { connectionId } = event.requestContext;
+            const { guessId, guessName, guessNameType, guessStatus, userId, gameId } =
+              JSON.parse(event.body);
+
+            if (guessStatus === false) {
+              await sendToAll(gameId, {
+                origin: "verifyGuessedNames",
+                guessId,
+                guessStatus,
+              });
+              return {
+                statusCode: 200,
+                body: JSON.stringify({ message: "Guess verified" }),
+              };
+            } else {
+              const userparams = {
+                TableName: "users",
+                Key: {
+                  id: userId,
+                },
+                UpdateExpression: "SET score = score + :increment",
+                ExpressionAttributeValues: {
+                  ":increment": 15,
+                },
+                ReturnValues: "ALL_NEW",
+              };
+
+              try {
+                const res = await dynamodb.update(userparams).promise();
+                const user = res.Attributes;
+                await sendToAll(gameId, {
+                  origin: "verifyGuessedNames",
+                  guessNameType,
+                  guessId,
+                  guessName,
+                  guessStatus,
+                  message: `${user.name} guessed ${guessName} correct!`,
+                  winnerUser: user,
+                });
+                return {
+                  statusCode: 200,
+                  body: JSON.stringify({ message: "Guess verified" }),
+                };
+              } catch (error) {
+                return {
+                  statusCode: 500,
+                  body: JSON.stringify({ message: "Error verifying guess" }),
+                };
+              }
+            }
+          };
+    DependsOn:
+      - nodeJSDependencyLayer
+
+  nextRoundCF:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: nextRoundCF
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: arn:aws:iam::858458372151:role/LabRole
+      Layers:
+        - !Ref nodeJSDependencyLayer
+      Code:
+        ZipFile: |
+          const AWS = require("aws-sdk");
+          const secretName = "MyWebSocketApi";
+          const secretsManager = new AWS.SecretsManager();
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+
+          const sendToOne = async (id, body) => {
+            try {
+              const secretData = await secretsManager
+                .getSecretValue({ SecretId: secretName })
+                .promise();
+              const secretValue = JSON.parse(secretData.SecretString);
+              const ENDPOINT =
+                secretValue.ApiId + ".execute-api.us-east-1.amazonaws.com/production/";
+              const client = new AWS.ApiGatewayManagementApi({ endpoint: ENDPOINT });
+              await client
+                .postToConnection({
+                  ConnectionId: id,
+                  Data: Buffer.from(JSON.stringify(body)),
+                })
+                .promise();
+            } catch (err) {
+              console.error(err);
+            }
+          };
+
+          const sendToAll = async (gameId, body) => {
+            const userparams = {
+              TableName: "users",
+              FilterExpression: "gameId = :gameId",
+              ExpressionAttributeValues: {
+                ":gameId": gameId,
+              },
+              ProjectionExpression: "id",
+            };
+            const result = await dynamodb.scan(userparams).promise();
+            let items = result.Items;
+            const all = items.map((i) => sendToOne(i.id, body));
+            return Promise.all(all);
+          };
+
+          exports.handler = async (event, context) => {
+            const { connectionId } = event.requestContext;
+            const { gameId } = JSON.parse(event.body);
+
+            let gameparams = {
+              TableName: "games",
+              Key: {
+                id: gameId,
+              },
+            };
+
+            try {
+              let res = await dynamodb.get(gameparams).promise();
+              let game = res.Item;
+
+              let userparams = {
+                TableName: "users",
+                FilterExpression: "gameId = :gameId AND currentRound = :currentRound",
+                ExpressionAttributeValues: {
+                  ":gameId": gameId,
+                  ":currentRound": game.currentRound,
+                },
+                ProjectionExpression: "id",
+              };
+              let result = await dynamodb.scan(userparams).promise();
+              let items = result.Items;
+
+              if (items.length == 0 && game.currentRound == game.totalRound) {
+                await sendToAll(gameId, {
+                  origin: "endGame",
+                  hasCompleted: true,
+                  message: "Game has finished",
+                });
+                return {
+                  statusCode: 200,
+                  body: JSON.stringify({ message: "Game has finished" }),
+                };
+              }
+
+              if (items.length == 0) {
+                let gameparams = {
+                  TableName: "games",
+                  Key: {
+                    id: gameId,
+                  },
+                  UpdateExpression: "SET currentRound = currentRound + :increment",
+                  ExpressionAttributeValues: {
+                    ":increment": 1,
+                  },
+                  ReturnValues: "ALL_NEW",
+                };
+                res = await dynamodb.update(gameparams).promise();
+                game = res.Item;
+
+                userparams = {
+                  TableName: "users",
+                  FilterExpression: "gameId = :gameId AND currentRound = :currentRound",
+                  ExpressionAttributeValues: {
+                    ":gameId": gameId,
+                    ":currentRound": game.currentRound,
+                  },
+                  ProjectionExpression: "id",
+                };
+                result = await dynamodb.scan(userparams).promise();
+                items = result.Items;
+              }
+
+              const selectorObj = items[Math.floor(Math.random() * items.length)];
+              const selectorId = selectorObj.id;
+
+              userparams = {
+                TableName: "users",
+                Key: {
+                  id: selectorId,
+                },
+                UpdateExpression: "SET currentRound = currentRound + :increment",
+                ExpressionAttributeValues: {
+                  ":increment": 1,
+                },
+                ReturnValues: "ALL_NEW",
+              };
+
+              gameparams = {
+                TableName: "games",
+                Key: {
+                  id: gameId,
+                },
+                UpdateExpression: "SET selectorId = :selectorId",
+                ExpressionAttributeValues: {
+                  ":selectorId": selectorId,
+                },
+                ProjectionExpression: "id",
+              };
+              await dynamodb.update(gameparams).promise();
+              const gameres = await dynamodb.update(userparams).promise();
+              const user = gameres.Attributes;
+              await sendToAll(gameId, {
+                origin: "nextRound",
+                hasCompleted: false,
+                message: `${user.name} is the new selector`,
+                selector: user,
+              });
+              return {
+                statusCode: 200,
+                body: JSON.stringify({ message: "Game started successfully" }),
+              };
+            } catch (err) {
+              return {
+                statusCode: 500,
+                body: JSON.stringify({ message: "Error starting next round" }),
+              };
+            }
+          };
+    DependsOn:
+      - nodeJSDependencyLayer
+
+  sendMessageCF:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: sendMessageCF
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: arn:aws:iam::858458372151:role/LabRole
+      Layers:
+        - !Ref nodeJSDependencyLayer
+      Code:
+        ZipFile: |
+          const AWS = require("aws-sdk");
+          const secretName = "MyWebSocketApi";
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+          const { Translate } = require("@google-cloud/translate").v2;
+          const secretsManager = new AWS.SecretsManager();
+          const projectId = "serverless-project-392613";
+          const credentials = {
+            type: "service_account",
+            project_id: "serverless-project-392613",
+            private_key_id: "01d0adf62c6678a96e824a94a6ea68b2c2a9a025",
+            private_key:
+              "-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQClIMct1g7pTzjO\nlo+N9VLrHwSe5O2YhT23e6MEvvP1GfCryjtHAd3bi/yVGfqNnVf4tJ6v1n2riXJP\n+P2f5k6GhgELhWaOt1R0PabozqIyGQ14AAHSPNtCZolkh7gTZ2DDR8dcy1n5fmdJ\nBOi/vN7zx1xMu5dXQSW+3vsoTOu4Z/mtboP1zmA+FfRJVzHTH6HO3JAslKRqQ/DN\njQreiPIMN1KNanr7afNxBpLuJNhe11BlRRb8t8Q0c+yXFtDROaRWa0xMdxxE1Ckk\n0NA1q653DLx+69AXpSTV9j3Zc5RUJRHt/u947EjTV0ZT0u83t0fDATliAkPrIIcr\nZ2YdndWBAgMBAAECggEAPGkJdVNikShSeAHM8vpVI39tiVPnOG1GbuHkedACICEl\nUzPhC9E7AR7tgP7IExcFIA+0HlAyGZdnIqrM3rq676wGpdhf9MZNN1l2vqUZ4YoY\ny1X1VJy++kPY79ZXGYIwfEC+Rsx+VjBQSP5qx/qo9jZxJgFbFKjYzkN1TwEVG5kX\nfg6DKYg4WPwffVBGKHHQMobISUE+k7e3H7GOnqGfaQVNkqMbdYl+hDJQW+tdOFgb\nxC3EGWDAtMB82eKiHVxS8sSZDiDfdfx52VQ2r4oMvpuBFjES6acd3fggGA1I15IF\nKuIujvSU5GW8WveKXLJTid+cL0iPWyqteIpw4XDbIQKBgQDdU5V8U7mHAsxk043A\n2hpO4rOQfi1dRkv3IOFVEJMbnJ9nvzm0rgU8n9XoT006+YLeYianbp/dCL+dR+Tz\nu575EdCnDdYyGM/9T8svLn/Ft5hFeC22RXWrQV7kDNqMTo6+4EhEacEo97jvWVF6\nVRqATceietqVLYjy9WWecF8XQwKBgQC+/1NAQ+nywklibdhwHGJsapc+jI+uyS/P\nDo2pKRl6aWSYdl9u/1prrF2iLtGJtbzIft/SIy7F4lEfG5t74L8jt9a9TbojleS9\nJyFN9f6XbBVlqxCwYptdKsdgdcFBB5tQRI8weKCIvd1e6jwKJuW5Z4Y7FvBYg2Z0\n0/J5kANp6wKBgQDFOHkJW5YEH9NAuV8kjXVJ/CtkQ3trFXwV0B/a7DUaMru8+CKU\nxUj3V7qGEzxPpA0g2zd0lVgw313X6juzkOm9KknSwrqu03trT1JQTdAfwFUY+llJ\nhaWwIEVNU8LfqhT7M+JRzCcKuYv7BI1dRD6kPCr7txvWOMhDL7cIszuY/wKBgQCN\nZey2GRErnVZCvluLtBfRd5/8uIbuuRbhzT5my3yHOVs12/yO6hCAwhyXot2Re7AF\nJpiAs3c/HGs+Amw7a4lV4hXiE5cIHUI4Hq3zT3hplaTJnbk/O+EVOkRcTxEBGaaL\n6BWxprwCP72RNQu54E4V0mR3fmX0wWKqfvZ1tH4yfQKBgCuQjLNc19/IfRljNJVx\nvh1hVUJ1437Uq7UT3a9g3ptrEznjkoTRiZSvY7dUVRUAVPSvq8/HlWnXnfL3G6uC\nWXGb4ABJw0lPaNxPi21Qce/xQ0O1tzzqcMmEJt9W7zSeCjlTNiiZcAA4tk/0qMR4\nJT6m4i1DQNycnBrTEcZo2SOG\n-----END PRIVATE KEY-----\n",
+            client_email: "serverless-project-392613@appspot.gserviceaccount.com",
+            client_id: "116249229907374514211",
+            auth_uri: "https://accounts.google.com/o/oauth2/auth",
+            token_uri: "https://oauth2.googleapis.com/token",
+            auth_provider_x509_cert_url: "https://www.googleapis.com/oauth2/v1/certs",
+            client_x509_cert_url:
+              "https://www.googleapis.com/robot/v1/metadata/x509/serverless-project-392613%40appspot.gserviceaccount.com",
+            universe_domain: "googleapis.com",
+          };
+
+          const translate = new Translate({ projectId, credentials });
+          const sendToOne = async (id, body) => {
+            try {
+              const secretData = await secretsManager
+                .getSecretValue({ SecretId: secretName })
+                .promise();
+              const secretValue = JSON.parse(secretData.SecretString);
+              const ENDPOINT =
+                secretValue.ApiId + ".execute-api.us-east-1.amazonaws.com/production/";
+              const client = new AWS.ApiGatewayManagementApi({ endpoint: ENDPOINT });
+              await client
+                .postToConnection({
+                  ConnectionId: id,
+                  Data: Buffer.from(JSON.stringify(body)),
+                })
+                .promise();
+            } catch (err) {
+              console.error(err);
+            }
+          };
+
+          const sendToAll = async (gameId, body) => {
+            const userparams = {
+              TableName: "users",
+              FilterExpression: "gameId = :gameId",
+              ExpressionAttributeValues: {
+                ":gameId": gameId,
+              },
+              ProjectionExpression: "id",
+            };
+            const result = await dynamodb.scan(userparams).promise();
+            let items = result.Items;
+            const all = items.map((i) => sendToOne(i.id, body));
+            return Promise.all(all);
+          };
+
+          exports.handler = async (event, context) => {
+            const nanoid = await import("nanoid");
+            const { connectionId } = event.requestContext;
+            const { gameId, name, chat, time } = JSON.parse(event.body);
+            const generatedId = nanoid.customAlphabet(
+              "1234567890abcdefghijklmnopqrstuvwxyz",
+              6
+            );
+            try {
+              const [[chaten], [chatfr], [chatru], [chathi], [chattr]] = await Promise.all([
+                translate.translate(chat, "en"),
+                translate.translate(chat, "fr"),
+                translate.translate(chat, "ru"),
+                translate.translate(chat, "hi"),
+                translate.translate(chat, "tr"),
+              ]);
+              await sendToAll(gameId, {
+                origin: "sendMessage",
+                gameId: gameId,
+                name: name,
+                chat: chat,
+                chaten: chaten,
+                chatfr: chatfr,
+                chatru: chatru,
+                chathi: chathi,
+                chattr: chattr,
+                time: time,
+                id: generatedId(),
+                senderId: connectionId,
+                message: `A new message by ${name}`,
+              });
+              return {
+                statusCode: 200,
+                body: JSON.stringify({ message: "Guessed send to lobby successfully" }),
+              };
+            } catch (e) {
+              return {
+                statusCode: 404,
+                body: JSON.stringify({ message: "User not found" }),
+              };
+            }
+          };
+    DependsOn:
+      - nodeJSDependencyLayer
+
+  sendEmailCF:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: sendEmailCF
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: arn:aws:iam::858458372151:role/LabRole
+      Layers:
+        - !Ref nodeJSDependencyLayer
+      Code:
+        ZipFile: |
+          const AWS = require("aws-sdk");
+          const secretName = "MyWebSocketApi";
+          const secretsManager = new AWS.SecretsManager();
+          const sns = new AWS.SNS({ region: "us-east-1" });
+
+          const sendToOne = async (id, body) => {
+            try {
+              const secretData = await secretsManager
+                .getSecretValue({ SecretId: secretName })
+                .promise();
+              const secretValue = JSON.parse(secretData.SecretString);
+              const ENDPOINT =
+                secretValue.ApiId + ".execute-api.us-east-1.amazonaws.com/production/";
+              const client = new AWS.ApiGatewayManagementApi({ endpoint: ENDPOINT });
+              await client
+                .postToConnection({
+                  ConnectionId: id,
+                  Data: Buffer.from(JSON.stringify(body)),
+                })
+                .promise();
+            } catch (err) {
+              console.error(err);
+            }
+          };
+
+          exports.handler = async (event, context) => {
+            const { connectionId } = event.requestContext;
+            const { gameId, body, email } = JSON.parse(event.body);
+
+            const topicArn = "arn:aws:sns:us-east-1:858458372151:tTimeCF";
+
+            try {
+              const isExisting = await checkSubscription(email);
+              if (!isExisting) {
+                const attributes = {
+                  email: [email],
+                };
+                const subscriptionResponse = await sns
+                  .subscribe({
+                    TopicArn: topicArn,
+                    Protocol: "email",
+                    Endpoint: email,
+                    Attributes: {
+                      FilterPolicy: JSON.stringify(attributes), // Convert the attributes to a JSON string
+                    },
+                  })
+                  .promise();
+                await sendToOne(connectionId, {
+                  origin: "sendEmail",
+                  message: "Please verify your email to get the results",
+                });
+                return {
+                  statusCode: 200,
+                  body: JSON.stringify({
+                    message: "Please verify your email to get the results",
+                  }),
+                };
+              }
+
+              const messageAttributes = {
+                email: {
+                  DataType: "String",
+                  StringValue: email,
+                },
+              };
+
+              await sns.publish(
+                {
+                  TopicArn: topicArn,
+                  Message: body,
+                  Subject: "Results for game " + gameId,
+                  MessageAttributes: messageAttributes,
+                },
+                (err, data) => {
+                  if (err) {
+                    console.error("Error publishing message:", err);
+                  } else {
+                    console.log("Message published:", data);
+                  }
+                }
+              );
+              await sendToOne(connectionId, {
+                origin: "sendEmail",
+                message: "Results sent to " + email + " successfully",
+              });
+              return {
+                statusCode: 200,
+                body: JSON.stringify({ message: "Email sent successfully" }),
+              };
+            } catch (e) {
+              console.error("Error creating entry:", e);
+              return {
+                statusCode: 500,
+                body: JSON.stringify({ message: "Email not sent" }),
+              };
+            }
+          };
+
+          async function checkSubscription(email) {
+            try {
+              const topicArn = "arn:aws:sns:us-east-1:858458372151:tTimeCF";
+
+              // List all subscriptions for the specified SNS topic
+              const response = await sns
+                .listSubscriptionsByTopic({ TopicArn: topicArn })
+                .promise();
+
+              // Check if the email is already subscribed to the topic
+              const isSubscribed = response.Subscriptions.some(
+                (subscription) =>
+                  subscription.Protocol === "email" && subscription.Endpoint === email
+              );
+              console.log(isSubscribed, "isSubscribed");
+              return isSubscribed;
+            } catch (error) {
+              console.error("Error checking subscription:", error);
+              throw error;
+            }
+          }
+    DependsOn:
+      - nodeJSDependencyLayer
+
+  connectIntegrationCF:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref MyWebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/${connectCF.Arn}/invocations
+      IntegrationMethod: POST
+
+  disconnectIntegrationCF:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref MyWebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/${disconnectCF.Arn}/invocations
+      IntegrationMethod: POST
+
+  createLobbyIntegrationCF:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref MyWebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/${createLobbyCF.Arn}/invocations
+      IntegrationMethod: POST
+
+  joinLobbyIntegrationCF:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref MyWebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/${joinLobbyCF.Arn}/invocations
+      IntegrationMethod: POST
+
+  startGameIntegrationCF:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref MyWebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/${startGameCF.Arn}/invocations
+      IntegrationMethod: POST
+
+  addNamesIntegrationCF:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref MyWebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/${addNamesCF.Arn}/invocations
+      IntegrationMethod: POST
+
+  guessNamesIntegrationCF:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref MyWebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/${guessNamesCF.Arn}/invocations
+      IntegrationMethod: POST
+
+  verifyGuessedNamesIntegrationCF:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref MyWebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/${verifyGuessedNamesCF.Arn}/invocations
+      IntegrationMethod: POST
+
+  nextRoundIntegrationCF:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref MyWebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/${nextRoundCF.Arn}/invocations
+      IntegrationMethod: POST
+
+  sendMessageIntegrationCF:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref MyWebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/${sendMessageCF.Arn}/invocations
+      IntegrationMethod: POST
+
+  sendEmailIntegrationCF:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref MyWebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/${sendEmailCF.Arn}/invocations
+      IntegrationMethod: POST
+
+  connectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref MyWebSocketApi
+      RouteKey: $connect
+      AuthorizationType: NONE
+      OperationName: Connect
+      Target: !Sub integrations/${connectIntegrationCF}
+
+  disconnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref MyWebSocketApi
+      RouteKey: $disconnect
+      AuthorizationType: NONE
+      OperationName: Disconnect
+      Target: !Sub integrations/${disconnectIntegrationCF}
+
+  createLobbyRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref MyWebSocketApi
+      RouteKey: createLobby
+      AuthorizationType: NONE
+      OperationName: createLobbyRoute
+      Target: !Sub integrations/${createLobbyIntegrationCF}
+
+  joinLobbyRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref MyWebSocketApi
+      RouteKey: joinLobby
+      AuthorizationType: NONE
+      OperationName: joinLobbyRoute
+      Target: !Sub integrations/${joinLobbyIntegrationCF}
+
+  startGameRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref MyWebSocketApi
+      RouteKey: startGame
+      AuthorizationType: NONE
+      OperationName: startGameRoute
+      Target: !Sub integrations/${startGameIntegrationCF}
+
+  addNamesRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref MyWebSocketApi
+      RouteKey: addNames
+      AuthorizationType: NONE
+      OperationName: addNamesRoute
+      Target: !Sub integrations/${addNamesIntegrationCF}
+
+  guessNamesRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref MyWebSocketApi
+      RouteKey: guessNames
+      AuthorizationType: NONE
+      OperationName: guessNamesRoute
+      Target: !Sub integrations/${guessNamesIntegrationCF}
+
+  verifyGuessedNamesRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref MyWebSocketApi
+      RouteKey: verifyGuessedNames
+      AuthorizationType: NONE
+      OperationName: verifyGuessedNamesRoute
+      Target: !Sub integrations/${verifyGuessedNamesIntegrationCF}
+
+  nextRoundRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref MyWebSocketApi
+      RouteKey: nextRound
+      AuthorizationType: NONE
+      OperationName: nextRoundRoute
+      Target: !Sub integrations/${nextRoundIntegrationCF}
+
+  sendMessageRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref MyWebSocketApi
+      RouteKey: sendMessage
+      AuthorizationType: NONE
+      OperationName: sendMessageRoute
+      Target: !Sub integrations/${sendMessageIntegrationCF}
+
+  sendEmailRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref MyWebSocketApi
+      RouteKey: sendEmail
+      AuthorizationType: NONE
+      OperationName: sendEmailRoute
+      Target: !Sub integrations/${sendEmailIntegrationCF}
+
+  WebSocketDeployment:
+    Type: AWS::ApiGatewayV2::Deployment
+    DependsOn:
+      - connectRoute
+      - disconnectRoute
+      - createLobbyRoute
+      - joinLobbyRoute
+      - startGameRoute
+      - addNamesRoute
+      - guessNamesRoute
+      - verifyGuessedNamesRoute
+      - nextRoundRoute
+      - sendMessageRoute
+      - sendEmailRoute
+    Properties:
+      ApiId: !Ref MyWebSocketApi
+
+  connectCFAPIGatewayPermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !GetAtt connectCF.Arn
+      Principal: apigateway.amazonaws.com
+    DependsOn:
+      - WebSocketDeployment
+
+  disconnectCFAPIGatewayPermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !GetAtt disconnectCF.Arn
+      Principal: apigateway.amazonaws.com
+    DependsOn:
+      - connectCFAPIGatewayPermission
+
+  createLobbyCFAPIGatewayPermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !GetAtt createLobbyCF.Arn
+      Principal: apigateway.amazonaws.com
+    DependsOn:
+      - disconnectCFAPIGatewayPermission
+
+  joinLobbyCFAPIGatewayPermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !GetAtt joinLobbyCF.Arn
+      Principal: apigateway.amazonaws.com
+    DependsOn:
+      - createLobbyCFAPIGatewayPermission
+
+  startGameCFAPIGatewayPermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !GetAtt startGameCF.Arn
+      Principal: apigateway.amazonaws.com
+    DependsOn:
+      - joinLobbyCFAPIGatewayPermission
+
+  addNamesCFAPIGatewayPermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !GetAtt addNamesCF.Arn
+      Principal: apigateway.amazonaws.com
+    DependsOn:
+      - startGameCFAPIGatewayPermission
+
+  guessNamesCFAPIGatewayPermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !GetAtt guessNamesCF.Arn
+      Principal: apigateway.amazonaws.com
+    DependsOn:
+      - addNamesCFAPIGatewayPermission
+
+  verifyGuessedNamesCFAPIGatewayPermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !GetAtt verifyGuessedNamesCF.Arn
+      Principal: apigateway.amazonaws.com
+    DependsOn:
+      - guessNamesCFAPIGatewayPermission
+
+  nextRoundCFAPIGatewayPermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !GetAtt nextRoundCF.Arn
+      Principal: apigateway.amazonaws.com
+    DependsOn:
+      - verifyGuessedNamesCFAPIGatewayPermission
+
+  sendMessageCFAPIGatewayPermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !GetAtt sendMessageCF.Arn
+      Principal: apigateway.amazonaws.com
+    DependsOn:
+      - nextRoundCFAPIGatewayPermission
+
+  sendEmailCFAPIGatewayPermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !GetAtt sendEmailCF.Arn
+      Principal: apigateway.amazonaws.com
+    DependsOn:
+      - sendMessageCFAPIGatewayPermission
+
+  WebSocketDeploymentStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref MyWebSocketApi
+      DeploymentId: !Ref WebSocketDeployment
+      StageName: production
+
+  MySNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: tTimeCF
+      TopicName: tTimeCF
+
+  gamesDyanamoDB:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      TableName: games
+
+  usersDyanamoDB:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      TableName: users
+
+  MyWebSocketApiSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: MyWebSocketApi
+      Description: Secret for storing API ID
+      SecretString:
+        Fn::Sub:
+          - |
+            {
+              "ApiId": "${ApiId}"
+            }
+          - ApiId: !Ref MyWebSocketApi
+
+  MyElasticBeanstalkApplication:
+    Type: AWS::ElasticBeanstalk::Application
+    Properties:
+      Description: My Elastic Beanstalk Application
+
+  MyElasticBeanstalkApplicationVersion:
+    Type: AWS::ElasticBeanstalk::ApplicationVersion
+    Properties:
+      ApplicationName: !Ref MyElasticBeanstalkApplication
+      SourceBundle:
+        S3Bucket: cf-templates-kjc1skhpxjxe-us-east-1
+        S3Key: frontend.zip
+
+  MyElasticBeanstalkEnvironment:
+    Type: AWS::ElasticBeanstalk::Environment
+    Properties:
+      ApplicationName: !Ref MyElasticBeanstalkApplication
+      EnvironmentName: MyElasticBeanstalkEnvironment
+      SolutionStackName: 64bit Amazon Linux 2 v5.8.4 running Node.js 18
+      VersionLabel: !Ref MyElasticBeanstalkApplicationVersion
+      Tier:
+        Name: WebServer
+        Type: Standard
+        Version: "1.0"
+      OptionSettings:
+        - Namespace: "aws:autoscaling:launchconfiguration"
+          OptionName: "InstanceType"
+          Value: "t3.micro"
+        - Namespace: aws:autoscaling:launchconfiguration
+          OptionName: IamInstanceProfile
+          Value: LabInstanceProfile
+        - Namespace: aws:autoscaling:launchconfiguration
+          OptionName: EC2KeyName
+          Value: vockey
+        - Namespace: aws:elasticbeanstalk:environment
+          OptionName: EnvironmentType
+          Value: LoadBalanced
+        - Namespace: aws:elasticbeanstalk:environment
+          OptionName: LoadBalancerType
+          Value: application
+        - Namespace: aws:elasticbeanstalk:environment
+          OptionName: ServiceRole
+          Value: LabRole
+        - Namespace: aws:elasticbeanstalk:application:environment
+          OptionName: NODE_ENV
+          Value: production
+
+Outputs:
+  WebSocketApiUrl:
+    Description: URL for the WebSocket API
+    Value: !Sub "wss://${MyWebSocketApi}.execute-api.us-east-1.amazonaws.com/production"
+
+  SNSTopicArn:
+    Description: ARN of the created SNS topic
+    Value: !Ref MySNSTopic
+
+  ElasticBeanstalkEndpoint:
+    Description: Elastic Beanstalk endpoint URL
+    Value: !GetAtt MyElasticBeanstalkEnvironment.EndpointURL
